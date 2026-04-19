@@ -37,6 +37,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data site/data cache
           git add -f data/ site/data/ cache/
           git add -u data/ site/data/ cache/
           git diff --cached --quiet || git commit -m "🔍 Scan $(date -u +%Y-%m-%d\ %H:%M) UTC"
