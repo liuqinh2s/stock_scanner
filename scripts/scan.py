@@ -21,6 +21,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import gzip
+
 import aiohttp
 
 # ── 路径 ──
@@ -62,17 +64,24 @@ _EM_FAIL_THRESHOLD = 5  # 连续失败 5 次后禁用
 # ══════════════════════════════════════════════════════════════
 
 def load_cache() -> dict:
-    # 优先读取拆分后的分片文件，兼容旧的单文件格式
+    # 优先读取 .gz 压缩分片，兼容旧的未压缩格式
     merged: dict = {}
     found_shards = False
     for prefix in CACHE_PREFIXES:
-        shard = CACHE_DIR / f"klines_{prefix}.json"
-        if shard.exists():
+        gz_shard = CACHE_DIR / f"klines_{prefix}.json.gz"
+        json_shard = CACHE_DIR / f"klines_{prefix}.json"
+        if gz_shard.exists():
             try:
-                merged.update(json.loads(shard.read_text()))
+                merged.update(json.loads(gzip.decompress(gz_shard.read_bytes())))
                 found_shards = True
             except Exception as e:
-                log.warning("缓存分片 %s 加载失败: %s", shard.name, e)
+                log.warning("缓存分片 %s 加载失败: %s", gz_shard.name, e)
+        elif json_shard.exists():
+            try:
+                merged.update(json.loads(json_shard.read_text()))
+                found_shards = True
+            except Exception as e:
+                log.warning("缓存分片 %s 加载失败: %s", json_shard.name, e)
     if found_shards:
         # 归一化 key: 去掉 "sh."/"sz."/"bj." 前缀, 统一用纯数字 code
         normalized = {}
@@ -114,16 +123,21 @@ def save_cache(all_sym: dict):
         shard = {k: v for k, v in slim.items() if _prefix(k) == prefix}
         if not shard:
             continue
-        shard_file = CACHE_DIR / f"klines_{prefix}.json"
-        shard_file.write_text(json.dumps(shard, ensure_ascii=False))
-        size_mb = shard_file.stat().st_size / 1024 / 1024
+        gz_file = CACHE_DIR / f"klines_{prefix}.json.gz"
+        raw = json.dumps(shard, ensure_ascii=False).encode()
+        gz_file.write_bytes(gzip.compress(raw))
+        size_mb = gz_file.stat().st_size / 1024 / 1024
         total_mb += size_mb
-        log.info("缓存分片 %s: %d 只股票, %.1f MB", prefix, len(shard), size_mb)
+        log.info("缓存分片 %s: %d 只股票, %.1f MB (gz)", prefix, len(shard), size_mb)
+        # 删除旧的未压缩 JSON
+        json_file = CACHE_DIR / f"klines_{prefix}.json"
+        if json_file.exists():
+            json_file.unlink()
     # 删除旧的单文件
     if CACHE_FILE.exists():
         CACHE_FILE.unlink()
         log.info("已删除旧缓存文件 klines.json")
-    log.info("缓存已保存: %d 只股票, 总计 %.1f MB", len(slim), total_mb)
+    log.info("缓存已保存: %d 只股票, 总计 %.1f MB (gz)", len(slim), total_mb)
 
 
 def merge_klines(old: list[list], new: list[list], cycle: str = "D") -> list[list]:

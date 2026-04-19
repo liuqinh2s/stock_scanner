@@ -3,3 +3,4 @@ site/
 data/
 .vscode/
 config.local.json
+cache/*.json
