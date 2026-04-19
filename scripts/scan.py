@@ -31,7 +31,8 @@ CACHE_PREFIXES = ["sh", "sz"]
 CYCLES = ["W", "D", "60", "15"]
 
 # 每个周期缓存保留根数
-CYCLE_MAX_BARS = {"15": 50, "60": 210, "D": 210, "W": 50}
+# 15m 保留 160 根 (约 2 周), 确保增量模式下有足够数据合成 D/W
+CYCLE_MAX_BARS = {"15": 160, "60": 210, "D": 210, "W": 50}
 
 # 东方财富 K线周期映射
 EM_KLT = {"15": "15", "60": "60", "D": "101", "W": "102"}
@@ -66,14 +67,24 @@ def load_cache() -> dict:
             except Exception as e:
                 log.warning("缓存分片 %s 加载失败: %s", shard.name, e)
     if found_shards:
-        log.info("加载缓存(分片): %d 只股票", len(merged))
-        return merged
+        # 归一化 key: 去掉 "sh."/"sz."/"bj." 前缀, 统一用纯数字 code
+        normalized = {}
+        for k, v in merged.items():
+            pure = k.split(".")[-1] if "." in k else k
+            normalized[pure] = v
+        log.info("加载缓存(分片): %d 只股票", len(normalized))
+        return normalized
     # fallback: 旧的单文件
     if CACHE_FILE.exists():
         try:
             data = json.loads(CACHE_FILE.read_text())
-            log.info("加载缓存(单文件): %d 只股票", len(data))
-            return data
+            # 归一化 key
+            normalized = {}
+            for k, v in data.items():
+                pure = k.split(".")[-1] if "." in k else k
+                normalized[pure] = v
+            log.info("加载缓存(单文件): %d 只股票", len(normalized))
+            return normalized
         except Exception as e:
             log.warning("缓存加载失败: %s", e)
     return {}
@@ -88,10 +99,12 @@ def save_cache(all_sym: dict):
                 keep = CYCLE_MAX_BARS.get(cycle, 50)
                 slim[code][cycle] = {"data": sym[cycle]["data"][-keep:]}
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    # 按交易所前缀拆分写入
+    # 按交易所前缀拆分写入 (code 为纯数字, 6/9 开头归 sh, 其余归 sz)
+    def _prefix(code: str) -> str:
+        return "sh" if code.startswith(("6", "9")) else "sz"
     total_mb = 0.0
     for prefix in CACHE_PREFIXES:
-        shard = {k: v for k, v in slim.items() if k.startswith(prefix + ".")}
+        shard = {k: v for k, v in slim.items() if _prefix(k) == prefix}
         if not shard:
             continue
         shard_file = CACHE_DIR / f"klines_{prefix}.json"
@@ -116,6 +129,125 @@ def merge_klines(old: list[list], new: list[list], cycle: str = "D") -> list[lis
         merged[bar[0]] = bar
     keep = CYCLE_MAX_BARS.get(cycle, 50)
     return [merged[k] for k in sorted(merged.keys())][-keep:]
+
+
+# ══════════════════════════════════════════════════════════════
+#  15m → 60m / D / W 合成
+# ══════════════════════════════════════════════════════════════
+
+# A股交易时段 (15m K线时间戳 → 所属60m段)
+# 上午: 09:30-10:30, 10:30-11:30  下午: 13:00-14:00, 14:00-15:00
+_60M_SLOT = {
+    "09:45": "10:30", "10:00": "10:30", "10:15": "10:30", "10:30": "10:30",
+    "10:45": "11:30", "11:00": "11:30", "11:15": "11:30", "11:30": "11:30",
+    "13:15": "14:00", "13:30": "14:00", "13:45": "14:00", "14:00": "14:00",
+    "14:15": "15:00", "14:30": "15:00", "14:45": "15:00", "15:00": "15:00",
+}
+
+
+def _ts_date(ts: str) -> str:
+    """从 '2026-04-18 10:30' 或 '2026-04-18' 提取日期部分"""
+    return ts[:10]
+
+
+def _ts_time(ts: str) -> str:
+    """从 '2026-04-18 10:30' 提取时间部分"""
+    return ts[11:16] if len(ts) > 10 else ""
+
+
+def _monday_of(date_str: str) -> str:
+    """返回 date_str 所在周的周一日期字符串"""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    monday = dt - timedelta(days=dt.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+
+def _merge_bar(base: list, bar: list) -> list:
+    """将 bar 合并到 base (OHLCVA), base 就地更新并返回"""
+    # base: [ts, open, high, low, close, volume, amount]
+    base[2] = max(base[2], bar[2])   # high
+    base[3] = min(base[3], bar[3])   # low
+    base[4] = bar[4]                 # close = 最新 close
+    base[5] += bar[5]                # volume 累加
+    base[6] += bar[6]                # amount 累加
+    return base
+
+
+def aggregate_15m_to_60m(bars_15m: list[list]) -> list[list]:
+    """将 15m K线合成 60m K线"""
+    groups: dict[str, list] = {}  # key = "2026-04-18 10:30"
+    for bar in bars_15m:
+        t = _ts_time(bar[0])
+        slot = _60M_SLOT.get(t)
+        if not slot:
+            continue
+        key = f"{_ts_date(bar[0])} {slot}"
+        if key not in groups:
+            groups[key] = [key, bar[1], bar[2], bar[3], bar[4], bar[5], bar[6]]
+        else:
+            _merge_bar(groups[key], bar)
+    return [groups[k] for k in sorted(groups.keys())]
+
+
+def aggregate_15m_to_daily(bars_15m: list[list]) -> list[list]:
+    """将 15m K线合成日线"""
+    groups: dict[str, list] = {}  # key = "2026-04-18"
+    for bar in bars_15m:
+        d = _ts_date(bar[0])
+        if d not in groups:
+            groups[d] = [d, bar[1], bar[2], bar[3], bar[4], bar[5], bar[6]]
+        else:
+            _merge_bar(groups[d], bar)
+    return [groups[k] for k in sorted(groups.keys())]
+
+
+def aggregate_daily_to_weekly(bars_d: list[list]) -> list[list]:
+    """将日线合成周线"""
+    groups: dict[str, list] = {}  # key = 周一日期
+    for bar in bars_d:
+        w = _monday_of(bar[0])
+        if w not in groups:
+            groups[w] = [w, bar[1], bar[2], bar[3], bar[4], bar[5], bar[6]]
+        else:
+            _merge_bar(groups[w], bar)
+    return [groups[k] for k in sorted(groups.keys())]
+
+
+def aggregate_from_15m(cached_sym: dict, fresh_15m: list[list]) -> dict:
+    """用新拉取的 15m 数据增量更新 60m / D / W 缓存.
+
+    策略:
+    - 15m: 直接 merge
+    - 60m: 从 fresh_15m 合成新的 60m bars, merge 到缓存
+    - D:   从 fresh_15m 合成新的日线 bars, merge 到缓存
+    - W:   从更新后的 D 数据合成周线 (保证完整性)
+    """
+    sym = {}
+    for k, v in cached_sym.items():
+        if k == "name":
+            sym[k] = v
+        else:
+            sym[k] = {"data": list(v.get("data", []))}
+
+    # 15m: merge
+    old_15 = sym.get("15", {}).get("data", [])
+    sym["15"] = {"data": merge_klines(old_15, fresh_15m, "15")}
+
+    # 60m: 从 fresh_15m 合成增量 60m bars, merge 到缓存
+    new_60 = aggregate_15m_to_60m(fresh_15m)
+    old_60 = sym.get("60", {}).get("data", [])
+    sym["60"] = {"data": merge_klines(old_60, new_60, "60")}
+
+    # D: 从 fresh_15m 合成增量日线, merge 到缓存
+    new_d = aggregate_15m_to_daily(fresh_15m)
+    old_d = sym.get("D", {}).get("data", [])
+    sym["D"] = {"data": merge_klines(old_d, new_d, "D")}
+
+    # W: 从完整 D 数据重新合成 (确保周线完整)
+    all_d = sym["D"]["data"]
+    sym["W"] = {"data": aggregate_daily_to_weekly(all_d)[-CYCLE_MAX_BARS["W"]:]}
+
+    return sym
 
 
 # ══════════════════════════════════════════════════════════════
@@ -205,12 +337,43 @@ async def fetch_klines(session: aiohttp.ClientSession, code: str, cycle: str,
     return result
 
 
+def _is_post_close() -> bool:
+    """判断当前北京时间是否在收盘后 (15:00 之后, 当天内)"""
+    bj = datetime.now(timezone(timedelta(hours=8)))
+    return bj.weekday() < 5 and bj.hour >= 15
+
+
 async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
                          cache: dict, max_concurrent: int = 50) -> dict:
-    """异步并发批量获取K线, 有缓存则增量合并"""
+    """异步并发批量获取K线.
+
+    增量模式 (缓存中已有 D/W 数据):
+        只拉 15m K线, 然后合成 60m / D / W — 请求量减少 75%.
+    冷启动 (无缓存):
+        全量拉 4 个周期.
+    收盘校准 (增量模式 + 15:00 后):
+        先走增量, 再全量拉 60m/D/W 覆盖合成数据, 确保准确.
+    """
     all_sym: dict = {}
     cached_codes_set = set(cache.keys())
     sem = asyncio.Semaphore(max_concurrent)
+
+    # 判断是否可以走增量模式: 缓存中有足够的历史数据
+    # 条件: 缓存中至少有 100 只股票且都有 D 数据
+    sample = list(cached_codes_set)[:200]
+    has_history = (len(sample) >= 100
+                   and sum(1 for c in sample
+                           if "D" in cache.get(c, {}) and len(cache[c]["D"].get("data", [])) >= 26)
+                   > len(sample) * 0.8)
+    incremental = has_history
+    post_close = _is_post_close()
+
+    if not incremental:
+        log.info("冷启动模式: 全量拉取 4 个周期")
+    elif post_close:
+        log.info("收盘校准模式: 先增量合成, 再全量拉取 60m/D/W 校准")
+    else:
+        log.info("增量模式: 仅拉取 15m K线, 合成其他周期")
 
     # 恢复缓存
     for s in stocks:
@@ -227,36 +390,73 @@ async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
             data = await fetch_klines(session, code, cycle, limit)
             return code, name, cycle, data
 
-    # 创建所有任务
-    tasks = []
-    for s in stocks:
-        for cycle in CYCLES:
-            tasks.append(_limited(s["code"], s["name"], cycle))
-
-    total = len(tasks)
-    log.info("开始并发获取 K 线: %d 个请求, 并发上限 %d", total, max_concurrent)
+    def _apply_results(results, all_sym, fresh_15m=None):
+        ok = 0
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if not isinstance(r, tuple) or len(r) != 4:
+                continue
+            code, name, cycle, data = r
+            if not data:
+                continue
+            ok += 1
+            if code not in all_sym:
+                all_sym[code] = {"name": name}
+            if fresh_15m is not None and cycle == "15":
+                fresh_15m[code] = data
+            elif cycle in all_sym[code] and all_sym[code][cycle].get("data"):
+                all_sym[code][cycle]["data"] = merge_klines(
+                    all_sym[code][cycle]["data"], data, cycle)
+            else:
+                all_sym[code][cycle] = {"data": data}
+        return ok
 
     t0 = time.time()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    ok_count = 0
-    for r in results:
-        if isinstance(r, Exception):
-            continue
-        if not isinstance(r, tuple) or len(r) != 4:
-            continue
-        code, name, cycle, data = r
-        if not data:
-            continue
-        ok_count += 1
-        if code not in all_sym:
+    if incremental:
+        # ── 第一阶段: 只拉 15m ──
+        tasks_15m = [_limited(s["code"], s["name"], "15") for s in stocks]
+        log.info("开始并发获取 15m K线: %d 个请求, 并发上限 %d", len(tasks_15m), max_concurrent)
+        results_15m = await asyncio.gather(*tasks_15m, return_exceptions=True)
+
+        fresh_15m: dict[str, list[list]] = {}
+        ok_count = _apply_results(results_15m, all_sym, fresh_15m)
+
+        # 合成 60m/D/W
+        agg_count = 0
+        for code, bars_15m in fresh_15m.items():
+            cached_sym = all_sym.get(code, {})
+            updated = aggregate_from_15m(cached_sym, bars_15m)
+            name = all_sym.get(code, {}).get("name", "")
             all_sym[code] = {"name": name}
-        # 合并缓存
-        if cycle in all_sym[code] and all_sym[code][cycle].get("data"):
-            all_sym[code][cycle]["data"] = merge_klines(
-                all_sym[code][cycle]["data"], data, cycle)
-        else:
-            all_sym[code][cycle] = {"data": data}
+            for cycle in CYCLES:
+                if cycle in updated and updated[cycle].get("data"):
+                    all_sym[code][cycle] = updated[cycle]
+            agg_count += 1
+        log.info("增量合成完成: %d 只股票从 15m 合成 60m/D/W", agg_count)
+
+        # ── 第二阶段: 收盘后全量校准 60m/D/W ──
+        if post_close:
+            calibrate_cycles = ["60", "D", "W"]
+            tasks_cal = []
+            for s in stocks:
+                for cycle in calibrate_cycles:
+                    tasks_cal.append(_limited(s["code"], s["name"], cycle))
+            log.info("收盘校准: 全量拉取 60m/D/W, %d 个请求", len(tasks_cal))
+            results_cal = await asyncio.gather(*tasks_cal, return_exceptions=True)
+            ok_cal = _apply_results(results_cal, all_sym)
+            ok_count += ok_cal
+            log.info("收盘校准完成: %d 个请求成功", ok_cal)
+    else:
+        # ── 冷启动: 全量 ──
+        tasks = []
+        for s in stocks:
+            for cycle in CYCLES:
+                tasks.append(_limited(s["code"], s["name"], cycle))
+        log.info("开始并发获取 K 线: %d 个请求, 并发上限 %d", len(tasks), max_concurrent)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ok_count = _apply_results(results, all_sym)
 
     elapsed = round(time.time() - t0, 1)
     log.info("K线完成: %d 只股票有数据, %d 个请求成功, 耗时 %ss", len(all_sym), ok_count, elapsed)
@@ -611,10 +811,6 @@ async def main():
     has_data = DATA_DIR.exists() and any(DATA_DIR.glob("*.json"))
 
     async with aiohttp.ClientSession() as session:
-        # 0. 探测市场是否活跃 (非交易时间直接退出)
-        if has_data and not await is_market_active(session, cache):
-            log.info("探针股票数据未更新, 判定为非交易时间, 跳过本次扫描")
-            return
         if not has_data:
             log.info("data 目录无数据, 强制执行首次扫描")
 
