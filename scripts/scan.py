@@ -367,11 +367,12 @@ def _fetch_klines_tdx_batch(server: tuple, tasks: list[tuple],
     tasks: [(code, market), ...]
     返回: {code: [[ts, o, h, l, c, vol, amt], ...]}
     """
+    import socket as _socket
     from pytdx.hq import TdxHq_API
     category = _TDX_CATEGORY.get(cycle)
     if category is None:
         return {}
-    api = TdxHq_API()
+    api = TdxHq_API(auto_retry=False)
     result = {}
     host, port = server
     total = len(tasks)
@@ -402,12 +403,27 @@ def _fetch_klines_tdx_batch(server: tuple, tasks: list[tuple],
                              host, i + 1, total, (i + 1) / total * 100)
     except Exception as e:
         log.warning("通达信 %s:%d 连接失败: %s", host, port, str(e)[:60])
+    finally:
+        # 强制关闭底层 socket, 防止 disconnect 卡住
+        try:
+            if hasattr(api, 'client') and api.client:
+                sock = getattr(api.client, 'client', None)
+                if sock and isinstance(sock, _socket.socket):
+                    sock.settimeout(0)
+                    try:
+                        sock.shutdown(_socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sock.close()
+            api.disconnect()
+        except Exception:
+            pass
     return result
 
 
 async def fetch_klines_tdx(stocks: list[dict], cycle: str,
                            limit: int = 160,
-                           timeout: int = 300) -> dict[str, list[list]]:
+                           timeout: int = 180) -> dict[str, list[list]]:
     """用通达信多服务器并行拉取 K 线 (线程池).
     每个服务器开 TDX_CONNS_PER_SERVER 个连接并行拉取.
     timeout: 最大等待秒数, 超时后放弃未完成的 worker."""
@@ -422,7 +438,9 @@ async def fetch_klines_tdx(stocks: list[dict], cycle: str,
     worker_servers = [servers[i // conns] for i in range(n_workers)]
 
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+    # daemon 线程池: 主进程退出时不会被卡住的线程阻塞
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
+    try:
         futures = [
             loop.run_in_executor(pool, _fetch_klines_tdx_batch,
                                  worker_servers[i], chunks[i], cycle, limit)
@@ -437,6 +455,8 @@ async def fetch_klines_tdx(stocks: list[dict], cycle: str,
                     log.warning("通达信 %s:%d 超时 (%ds), 跳过", s[0], s[1], timeout)
             for p in pending:
                 p.cancel()
+    finally:
+        pool.shutdown(wait=False)
 
     merged: dict[str, list[list]] = {}
     for f in done:
