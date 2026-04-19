@@ -1,0 +1,60 @@
+name: A Stock Scan
+
+on:
+  workflow_dispatch:          # 手动触发
+  schedule:
+    # A股交易时间 9:30-15:00 (UTC+8), 即 UTC 1:30-7:00
+    # 每15分钟跑一次, 周一到周五
+    - cron: '*/15 1-7 * * 1-5'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  scan-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        run: python scripts/scan.py
+
+      - name: Build site
+        run: python scripts/build.py
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/ site/data/ cache/
+          git add -u data/ site/data/ cache/
+          git diff --cached --quiet || git commit -m "🔍 Scan $(date -u +%Y-%m-%d\ %H:%M) UTC"
+          git pull --rebase origin main
+          git push
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+  deploy:
+    needs: scan-and-deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
