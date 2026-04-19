@@ -10,9 +10,11 @@ A股股票扫描器 — 扫描脚本
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import math
+import random
 import re
 import sys
 import time
@@ -48,6 +50,11 @@ proxy_url = (f"http://{_proxy_cfg['host']}:{_proxy_cfg['port']}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("scan")
+
+# 东方财富 K 线源开关 (连续失败后自动禁用, 避免浪费重试)
+_em_kline_fail_count = 0
+_em_kline_disabled = False
+_EM_FAIL_THRESHOLD = 5  # 连续失败 5 次后禁用
 
 
 # ══════════════════════════════════════════════════════════════
@@ -157,7 +164,7 @@ def _ts_time(ts: str) -> str:
 
 def _monday_of(date_str: str) -> str:
     """返回 date_str 所在周的周一日期字符串"""
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
     monday = dt - timedelta(days=dt.weekday())
     return monday.strftime("%Y-%m-%d")
 
@@ -269,43 +276,261 @@ def _em_secid(code: str) -> str:
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> any:
     """带重试的 HTTP GET"""
+    domain = url.split("/")[2] if "/" in url else url[:40]
     for attempt in range(3):
         try:
+            await asyncio.sleep(random.uniform(0.1, 0.5))
             async with session.get(url, proxy=proxy_url,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                                   timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status == 200:
-                    return await resp.json()
-                log.warning("HTTP %d: %s", resp.status, url[:80])
+                    return await resp.json(content_type=None)
+                log.warning("[%s] HTTP %d (attempt %d/3)", domain, resp.status, attempt + 1)
         except Exception as e:
-            if attempt == 2:
-                log.warning("请求失败 (%d/3): %s", attempt + 1, str(e)[:60])
-        await asyncio.sleep(1 * (attempt + 1))
+            log.warning("[%s] 请求失败 (%d/3): %s", domain, attempt + 1, str(e)[:60])
+        await asyncio.sleep(2 * (attempt + 1))
     return None
 
 
 async def fetch_all_stocks(session: aiohttp.ClientSession) -> list[dict]:
-    """获取全部A股股票列表 (东方财富全市场行情接口, 一次返回)"""
-    url = ("https://push2.eastmoney.com/api/qt/clist/get"
-           "?pn=1&pz=10000&po=1&np=1&fltt=2&invt=2"
-           "&fields=f12,f14&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23")
-    data = await fetch_json(session, url)
-    if not data or data.get("data") is None:
-        log.error("获取股票列表失败")
-        return []
+    """获取全部A股股票列表 (东方财富 datacenter-web 接口, 分页获取)"""
     stocks = []
-    for item in data["data"].get("diff", []):
-        code = str(item.get("f12", ""))
-        name = str(item.get("f14", ""))
-        if not code or "ST" in name or "退" in name:
-            continue
-        stocks.append({"code": code, "name": name})
+    page = 1
+    while True:
+        url = ("https://datacenter-web.eastmoney.com/api/data/v1/get"
+               "?reportName=RPT_DMSK_TS_STOCKNEW"
+               "&columns=SECURITY_CODE,SECURITY_NAME_ABBR"
+               f"&pageSize=500&pageNumber={page}"
+               "&sortColumns=SECURITY_CODE&sortTypes=1")
+        data = await fetch_json(session, url)
+        if not data or not data.get("success") or data.get("result") is None:
+            if page == 1:
+                log.error("获取股票列表失败")
+                return []
+            break
+        rows = data["result"].get("data", [])
+        if not rows:
+            break
+        for item in rows:
+            code = str(item.get("SECURITY_CODE", ""))
+            name = str(item.get("SECURITY_NAME_ABBR", ""))
+            if not code or "ST" in name or "退" in name:
+                continue
+            stocks.append({"code": code, "name": name})
+        total_pages = data["result"].get("pages", 0)
+        if page >= total_pages:
+            break
+        page += 1
     log.info("获取到 %d 只A股", len(stocks))
     return stocks
 
 
-async def fetch_klines(session: aiohttp.ClientSession, code: str, cycle: str,
-                       limit: int = 210) -> list[list]:
-    """获取单只股票单个周期的K线 (东方财富接口, 盘中实时)"""
+# ══════════════════════════════════════════════════════════════
+#  通达信 (pytdx) — 分钟线主源, 券商级接口, 几乎不封 IP
+# ══════════════════════════════════════════════════════════════
+
+TDX_SERVERS = [
+    ("180.153.18.170", 7709),
+    ("60.191.117.167", 7709),
+    ("115.238.56.198", 7709),
+    ("218.75.126.9", 7709),
+]
+
+# 每个通达信服务器开几个并行连接 (连接数 × 服务器数 = 总并发)
+TDX_CONNS_PER_SERVER = 2
+
+# pytdx category 映射: 0=5m, 1=15m, 2=30m, 3=60m, 4=日线, 11=周线
+_TDX_CATEGORY = {"15": 1, "60": 3, "D": 4, "W": 11}
+
+
+def _tdx_market(code: str) -> int:
+    """股票代码 -> 通达信市场: 1=上海, 0=深圳"""
+    return 1 if code.startswith(("6", "9")) else 0
+
+
+def _fetch_klines_tdx_batch(server: tuple, tasks: list[tuple],
+                            cycle: str, limit: int) -> dict[str, list[list]]:
+    """同步: 单个通达信连接批量拉取一组股票的 K 线.
+    tasks: [(code, market), ...]
+    返回: {code: [[ts, o, h, l, c, vol, amt], ...]}
+    """
+    from pytdx.hq import TdxHq_API
+    category = _TDX_CATEGORY.get(cycle)
+    if category is None:
+        return {}
+    api = TdxHq_API()
+    result = {}
+    host, port = server
+    total = len(tasks)
+    try:
+        with api.connect(host, port, time_out=10):
+            for i, (code, market) in enumerate(tasks):
+                try:
+                    data = api.get_security_bars(category, market, code, 0, limit)
+                    if not data:
+                        continue
+                    bars = []
+                    for bar in data:
+                        bars.append([
+                            bar["datetime"],
+                            float(bar["open"]),
+                            float(bar["high"]),
+                            float(bar["low"]),
+                            float(bar["close"]),
+                            float(bar["vol"]),
+                            float(bar["amount"]),
+                        ])
+                    if bars:
+                        result[code] = bars
+                except Exception:
+                    continue
+                if (i + 1) % 100 == 0 or i + 1 == total:
+                    log.info("  通达信 %s: %d/%d (%.0f%%)",
+                             host, i + 1, total, (i + 1) / total * 100)
+    except Exception as e:
+        log.warning("通达信 %s:%d 连接失败: %s", host, port, str(e)[:60])
+    return result
+
+
+async def fetch_klines_tdx(stocks: list[dict], cycle: str,
+                           limit: int = 160,
+                           timeout: int = 300) -> dict[str, list[list]]:
+    """用通达信多服务器并行拉取 K 线 (线程池).
+    每个服务器开 TDX_CONNS_PER_SERVER 个连接并行拉取.
+    timeout: 最大等待秒数, 超时后放弃未完成的 worker."""
+    servers = TDX_SERVERS
+    conns = TDX_CONNS_PER_SERVER
+    n_workers = len(servers) * conns
+    # 构建任务列表
+    all_tasks = [(s["code"], _tdx_market(s["code"])) for s in stocks]
+    # 均分到各 worker (同一服务器的多个连接分到不同 chunk)
+    chunks = [all_tasks[i::n_workers] for i in range(n_workers)]
+    # worker -> server 映射: worker 0,1 -> server 0, worker 2,3 -> server 1, ...
+    worker_servers = [servers[i // conns] for i in range(n_workers)]
+
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            loop.run_in_executor(pool, _fetch_klines_tdx_batch,
+                                 worker_servers[i], chunks[i], cycle, limit)
+            for i in range(n_workers)
+        ]
+        # 带超时等待: 到时间后收集已完成的结果, 不再等卡住的服务器
+        done, pending = await asyncio.wait(futures, timeout=timeout)
+        if pending:
+            for i, f in enumerate(futures):
+                if f in pending:
+                    s = worker_servers[i]
+                    log.warning("通达信 %s:%d 超时 (%ds), 跳过", s[0], s[1], timeout)
+            for p in pending:
+                p.cancel()
+
+    merged: dict[str, list[list]] = {}
+    for f in done:
+        try:
+            r = f.result()
+        except Exception:
+            continue
+        if isinstance(r, dict):
+            merged.update(r)
+    return merged
+
+
+def _tx_code(code: str) -> str:
+    """股票代码转腾讯/新浪格式: 600519 -> sh600519, 000001 -> sz000001"""
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+# 腾讯 K 线周期映射 (仅支持日线/周线)
+_TX_KLT = {"D": "day", "W": "week"}
+
+
+async def _fetch_klines_sina(session: aiohttp.ClientSession, code: str,
+                             cycle: str, limit: int = 210) -> list[list]:
+    """新浪财经 K 线 (支持分钟线: 15/60, 也支持日线/周线)"""
+    sina_code = _tx_code(code)
+    scale_map = {"15": 15, "60": 60, "D": 240, "W": 1680}
+    scale = scale_map.get(cycle)
+    if scale is None:
+        return []
+    # 使用 json_v2 接口, 直接返回 JSON (无需解析 JSONP)
+    url = (f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData"
+           f"?symbol={sina_code}&scale={scale}&datalen={limit}&ma=")
+    for attempt in range(3):
+        try:
+            await asyncio.sleep(random.uniform(0.05, 0.3))
+            async with session.get(url, proxy=proxy_url,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    continue
+                items = await resp.json(content_type=None)
+                if not isinstance(items, list):
+                    continue
+                result = []
+                for item in items:
+                    try:
+                        result.append([
+                            item["day"],
+                            float(item["open"]),
+                            float(item["high"]),
+                            float(item["low"]),
+                            float(item["close"]),
+                            float(item["volume"]),
+                            float(item.get("amount", 0)),
+                        ])
+                    except (ValueError, KeyError):
+                        continue
+                return result
+        except Exception as e:
+            if attempt == 2:
+                log.warning("新浪请求失败 (%d/3) %s: %s", attempt + 1, sina_code, str(e)[:60])
+        await asyncio.sleep(1.5 * (attempt + 1))
+    return []
+
+
+async def _fetch_klines_tx(session: aiohttp.ClientSession, code: str,
+                           cycle: str, limit: int = 210) -> list[list]:
+    """腾讯财经 K 线 (仅日线/周线)"""
+    tx_code = _tx_code(code)
+    klt = _TX_KLT.get(cycle)
+    if not klt:
+        return []
+    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+           f"?param={tx_code},{klt},,,{limit},qfq")
+    data = await fetch_json(session, url)
+    if not data or data.get("code") != 0 or not isinstance(data.get("data"), dict):
+        return []
+    stock_data = data["data"].get(tx_code, {})
+    klines_raw = (stock_data.get(f"qfq{klt}") or stock_data.get(klt) or [])
+    result = []
+    for bar in klines_raw:
+        # 腾讯格式: [date, open, close, high, low, volume]
+        if not isinstance(bar, list) or len(bar) < 6:
+            continue
+        try:
+            close = float(bar[2])
+            result.append([
+                bar[0],
+                float(bar[1]),      # open
+                float(bar[3]),      # high
+                float(bar[4]),      # low
+                close,              # close
+                float(bar[5]),      # volume
+                float(bar[5]) * close,  # 近似 amount
+            ])
+        except (ValueError, IndexError):
+            continue
+    return result
+
+
+async def _fetch_klines_em(session: aiohttp.ClientSession, code: str,
+                           cycle: str, limit: int = 210) -> list[list]:
+    """东方财富 K 线 (最后备用, 连续失败自动禁用)"""
+    global _em_kline_fail_count, _em_kline_disabled
+    if _em_kline_disabled:
+        return []
     secid = _em_secid(code)
     klt = EM_KLT[cycle]
     url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -314,27 +539,52 @@ async def fetch_klines(session: aiohttp.ClientSession, code: str, cycle: str,
            f"&fields2=f51,f52,f53,f54,f55,f56,f57")
     data = await fetch_json(session, url)
     if not data or data.get("data") is None:
+        _em_kline_fail_count += 1
+        if _em_kline_fail_count >= _EM_FAIL_THRESHOLD and not _em_kline_disabled:
+            _em_kline_disabled = True
+            log.warning("东方财富 K 线连续失败 %d 次, 已禁用", _em_kline_fail_count)
         return []
+    _em_kline_fail_count = 0  # 成功则重置
     klines_raw = data["data"].get("klines", [])
     result = []
     for line in klines_raw:
-        # 格式: "2026-04-18,10.50,10.80,10.30,10.60,123456,1234567.00"
         parts = line.split(",")
         if len(parts) < 7:
             continue
         try:
             result.append([
-                parts[0],           # 时间戳
+                parts[0],
                 float(parts[1]),    # open
                 float(parts[2]),    # high
                 float(parts[3]),    # low
                 float(parts[4]),    # close
-                float(parts[5]),    # volume (手)
-                float(parts[6]),    # amount (元)
+                float(parts[5]),    # volume
+                float(parts[6]),    # amount
             ])
         except (ValueError, IndexError):
             continue
     return result
+
+
+async def fetch_klines(session: aiohttp.ClientSession, code: str, cycle: str,
+                       limit: int = 210) -> list[list]:
+    """获取K线 — 多源容错:
+       分钟线 (15/60): 新浪(主) -> 东方财富(备)
+       日线/周线:       腾讯(主) -> 新浪(备) -> 东方财富(备)
+    """
+    if cycle in ("15", "60"):
+        result = await _fetch_klines_sina(session, code, cycle, limit)
+        if result:
+            return result
+        return await _fetch_klines_em(session, code, cycle, limit)
+    else:
+        result = await _fetch_klines_tx(session, code, cycle, limit)
+        if result:
+            return result
+        result = await _fetch_klines_sina(session, code, cycle, limit)
+        if result:
+            return result
+        return await _fetch_klines_em(session, code, cycle, limit)
 
 
 def _is_post_close() -> bool:
@@ -344,7 +594,7 @@ def _is_post_close() -> bool:
 
 
 async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
-                         cache: dict, max_concurrent: int = 50) -> dict:
+                         cache: dict, max_concurrent: int = 15) -> dict:
     """异步并发批量获取K线.
 
     增量模式 (缓存中已有 D/W 数据):
@@ -415,13 +665,34 @@ async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
     t0 = time.time()
 
     if incremental:
-        # ── 第一阶段: 只拉 15m ──
-        tasks_15m = [_limited(s["code"], s["name"], "15") for s in stocks]
-        log.info("开始并发获取 15m K线: %d 个请求, 并发上限 %d", len(tasks_15m), max_concurrent)
-        results_15m = await asyncio.gather(*tasks_15m, return_exceptions=True)
-
+        # ── 第一阶段: 通达信批量拉 15m (主源, 多服务器并行) ──
+        cached_stocks = [s for s in stocks if s["code"] in cached_codes_set]
+        log.info("通达信拉取 15m K线: %d 只股票, %d 个服务器 × %d 连接并行",
+                 len(cached_stocks), len(TDX_SERVERS), TDX_CONNS_PER_SERVER)
+        tdx_result = await fetch_klines_tdx(cached_stocks, "15",
+                                            limit=CYCLE_MAX_BARS.get("15", 160))
         fresh_15m: dict[str, list[list]] = {}
-        ok_count = _apply_results(results_15m, all_sym, fresh_15m)
+        ok_count = 0
+        name_map = {s["code"]: s["name"] for s in cached_stocks}
+        for code, bars in tdx_result.items():
+            if not bars:
+                continue
+            ok_count += 1
+            if code not in all_sym:
+                all_sym[code] = {"name": name_map.get(code, "")}
+            fresh_15m[code] = bars
+            all_sym[code]["15"] = {"data": bars}
+        log.info("通达信完成: %d/%d 只成功", ok_count, len(cached_stocks))
+
+        # 通达信拉不到的, 用新浪补 (少量, 不会触发封 IP)
+        missing = [s for s in cached_stocks if s["code"] not in tdx_result]
+        if missing:
+            log.info("新浪补拉 15m: %d 只", len(missing))
+            tasks_fallback = [_limited(s["code"], s["name"], "15") for s in missing]
+            results_fb = await asyncio.gather(*tasks_fallback, return_exceptions=True)
+            fb_ok = _apply_results(results_fb, all_sym, fresh_15m)
+            ok_count += fb_ok
+            log.info("新浪补拉完成: %d 只成功", fb_ok)
 
         # 合成 60m/D/W
         agg_count = 0
@@ -436,40 +707,151 @@ async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
             agg_count += 1
         log.info("增量合成完成: %d 只股票从 15m 合成 60m/D/W", agg_count)
 
+        # ── 新股票: 缓存中没有的, 全量拉 4 个周期 ──
+        new_stocks = [s for s in stocks if s["code"] not in cached_codes_set]
+        if new_stocks:
+            log.info("新股票全量拉取: %d 只", len(new_stocks))
+            name_map_new = {s["code"]: s["name"] for s in new_stocks}
+            for cycle in CYCLES:
+                log.info("  新股票拉取 %s ...", cycle)
+                new_result = await fetch_klines_tdx(
+                    new_stocks, cycle, limit=CYCLE_MAX_BARS.get(cycle, 210))
+                new_ok = 0
+                for code, bars in new_result.items():
+                    if not bars:
+                        continue
+                    new_ok += 1
+                    if code not in all_sym:
+                        all_sym[code] = {"name": name_map_new.get(code, "")}
+                    all_sym[code][cycle] = {"data": bars}
+                ok_count += new_ok
+            log.info("新股票完成: %d 只有数据", sum(1 for s in new_stocks if s["code"] in all_sym))
+
+        # ── 腾讯补拉: 通达信周线/日线不够的, 用腾讯补 ──
+        short_stocks = [{"code": code} for code, sym in all_sym.items()
+                        if len(sym.get("W", {}).get("data", [])) < 20
+                        or len(sym.get("D", {}).get("data", [])) < 26]
+        if short_stocks:
+            for sup_cycle in ("W", "D"):
+                need = [s for s in short_stocks
+                        if len(all_sym.get(s["code"], {}).get(sup_cycle, {}).get("data", [])) <
+                        (20 if sup_cycle == "W" else 26)]
+                if not need:
+                    continue
+                log.info("腾讯补拉 %s: %d 只 (通达信数据不足)", sup_cycle, len(need))
+                tasks_sup = [_limited(s["code"],
+                                      all_sym.get(s["code"], {}).get("name", ""),
+                                      sup_cycle) for s in need]
+                results_sup = await asyncio.gather(*tasks_sup, return_exceptions=True)
+                sup_ok = _apply_results(results_sup, all_sym)
+                ok_count += sup_ok
+                log.info("腾讯补拉 %s 完成: %d 只成功", sup_cycle, sup_ok)
+
         # ── 第二阶段: 收盘后全量校准 60m/D/W ──
         if post_close:
             calibrate_cycles = ["60", "D", "W"]
-            tasks_cal = []
-            for s in stocks:
-                for cycle in calibrate_cycles:
-                    tasks_cal.append(_limited(s["code"], s["name"], cycle))
-            log.info("收盘校准: 全量拉取 60m/D/W, %d 个请求", len(tasks_cal))
-            results_cal = await asyncio.gather(*tasks_cal, return_exceptions=True)
-            ok_cal = _apply_results(results_cal, all_sym)
-            ok_count += ok_cal
-            log.info("收盘校准完成: %d 个请求成功", ok_cal)
+            for cal_cycle in calibrate_cycles:
+                log.info("收盘校准: 通达信拉取 %s", cal_cycle)
+                cal_result = await fetch_klines_tdx(
+                    cached_stocks, cal_cycle,
+                    limit=CYCLE_MAX_BARS.get(cal_cycle, 210))
+                cal_ok = 0
+                for code, bars in cal_result.items():
+                    if not bars:
+                        continue
+                    cal_ok += 1
+                    if code not in all_sym:
+                        continue
+                    if cal_cycle in all_sym[code] and all_sym[code][cal_cycle].get("data"):
+                        all_sym[code][cal_cycle]["data"] = merge_klines(
+                            all_sym[code][cal_cycle]["data"], bars, cal_cycle)
+                    else:
+                        all_sym[code][cal_cycle] = {"data": bars}
+                ok_count += cal_ok
+                log.info("收盘校准 %s 完成: %d 只成功", cal_cycle, cal_ok)
     else:
-        # ── 冷启动: 全量 ──
-        tasks = []
-        for s in stocks:
-            for cycle in CYCLES:
-                tasks.append(_limited(s["code"], s["name"], cycle))
-        log.info("开始并发获取 K 线: %d 个请求, 并发上限 %d", len(tasks), max_concurrent)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        ok_count = _apply_results(results, all_sym)
+        # ── 冷启动: 通达信全量拉 4 个周期 ──
+        for cycle in CYCLES:
+            log.info("冷启动: 通达信拉取 %s", cycle)
+            cycle_result = await fetch_klines_tdx(
+                stocks, cycle, limit=CYCLE_MAX_BARS.get(cycle, 210))
+            cycle_ok = 0
+            for code, bars in cycle_result.items():
+                if not bars:
+                    continue
+                cycle_ok += 1
+                name_map = {s["code"]: s["name"] for s in stocks}
+                if code not in all_sym:
+                    all_sym[code] = {"name": name_map.get(code, "")}
+                all_sym[code][cycle] = {"data": bars}
+            ok_count += cycle_ok
+            log.info("冷启动 %s 完成: %d 只成功", cycle, cycle_ok)
 
     elapsed = round(time.time() - t0, 1)
     log.info("K线完成: %d 只股票有数据, %d 个请求成功, 耗时 %ss", len(all_sym), ok_count, elapsed)
     return all_sym
 
 
+def calc_market_turnover(all_sym: dict) -> dict:
+    """从全市场日线数据计算每日总成交额, 返回市场热度判断.
+
+    策略:
+    - 汇总每个交易日所有股票的成交额 (bar[6])
+    - 用近 60 个交易日的成交额分布来判断当前热度
+    - 分位数判断: >75% 火热, <25% 冷清, 中间正常
+    - 额外输出: 当日总成交额 (亿), 近期均值, 分位数
+
+    返回: {"level": "hot"/"normal"/"cold"/"unknown",
+           "today_amount": 亿, "avg_amount": 亿, "percentile": 0~100}
+    """
+    # 汇总每个交易日的全市场成交额
+    daily_totals: dict[str, float] = {}  # date -> 总成交额
+    for code, sym in all_sym.items():
+        d_data = sym.get("D", {}).get("data", [])
+        for bar in d_data:
+            date = bar[0][:10]
+            daily_totals[date] = daily_totals.get(date, 0) + float(bar[6])
+
+    if len(daily_totals) < 10:
+        return {"level": "unknown", "today_amount": 0, "avg_amount": 0, "percentile": 50}
+
+    # 按日期排序, 取最近 60 个交易日
+    sorted_dates = sorted(daily_totals.keys())
+    recent_dates = sorted_dates[-60:]
+    recent_amounts = [daily_totals[d] for d in recent_dates]
+
+    today_amount = recent_amounts[-1]
+    avg_amount = sum(recent_amounts) / len(recent_amounts)
+
+    # 计算当日成交额在近期的分位数
+    rank = sum(1 for a in recent_amounts if a <= today_amount)
+    percentile = round(rank / len(recent_amounts) * 100)
+
+    # 判断热度
+    if percentile >= 75:
+        level = "hot"
+    elif percentile <= 25:
+        level = "cold"
+    else:
+        level = "normal"
+
+    yi = 1e8  # 亿
+    log.info("市场成交额: 今日 %.0f亿, 近%d日均值 %.0f亿, 分位 %d%% → %s",
+             today_amount / yi, len(recent_amounts), avg_amount / yi, percentile, level)
+
+    return {
+        "level": level,
+        "today_amount": round(today_amount / yi),
+        "avg_amount": round(avg_amount / yi),
+        "percentile": percentile,
+    }
+
+
 async def get_index_direction(session: aiohttp.ClientSession) -> str:
-    """上证指数方向 (东方财富接口)"""
+    """上证指数方向 (东方财富接口) — 保留作为辅助参考"""
     try:
-        # 上证指数 secid = 1.000001
         data = await fetch_klines(session, "000001", "D", 30)
         if not data:
-            # 尝试直接用 secid
             url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
                    f"?secid=1.000001&klt=101&fqt=1&lmt=30&end=20500101"
                    f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57")
@@ -810,7 +1192,12 @@ async def main():
     # 如果 data 目录不存在或没有数据文件, 强制扫描 (首次部署必须生成数据)
     has_data = DATA_DIR.exists() and any(DATA_DIR.glob("*.json"))
 
-    async with aiohttp.ClientSession() as session:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Referer": "https://quote.eastmoney.com/",
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
         if not has_data:
             log.info("data 目录无数据, 强制执行首次扫描")
 
@@ -821,9 +1208,9 @@ async def main():
             sys.exit(1)
 
         # 2. K线 (带缓存, 异步并发)
-        all_sym = await fetch_all_data(session, stocks, cache, max_concurrent=50)
+        all_sym = await fetch_all_data(session, stocks, cache, max_concurrent=15)
 
-        # 3. 大盘方向
+        # 3. 大盘方向 (上证指数, 辅助参考)
         index_direction = await get_index_direction(session)
 
     # 4. 保存缓存
@@ -833,6 +1220,9 @@ async def main():
     log.info("计算技术指标...")
     compute_indicators(all_sym)
     log.info("上证指数方向: %s", index_direction)
+
+    # 5.5 市场成交额热度
+    market_turnover = calc_market_turnover(all_sym)
 
     # 6. 扫描
     log.info("全市场扫描...")
@@ -858,7 +1248,8 @@ async def main():
 
         a = detect_volume_anomaly(all_sym, code)
         if a: tags.append(f"成交量异动({a})")
-        if index_direction == "up": tags.append("大盘看多")
+        if market_turnover["level"] == "hot": tags.append("大盘火热")
+        elif market_turnover["level"] == "cold": tags.append("大盘冷清")
         if check_anti_chase(sym): tags.append("未追高")
         if is_not_rubbish(sym): tags.append("波动充足")
         if code in leading: tags.append("龙头股")
@@ -891,6 +1282,7 @@ async def main():
         "scanTime": scan_time, "totalSymbols": len(all_sym),
         "validSymbols": valid_count, "filteredCount": default_count,
         "totalTagged": len(result_tokens), "indexDirection": index_direction,
+        "marketTurnover": market_turnover,
         "elapsed": elapsed, "tokens": result_tokens,
     }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
