@@ -1583,8 +1583,8 @@ async def main():
         if code in leading: tags.append("龙头股")
         if is_low_vol_good_move(sym): tags.append("小量大涨")
         if detect_consolidation_breakout(sym, "60"): tags.append("盘整突破")
-        ambush, ambush_details = detect_ambush_setup(sym, all_sym, code, "D")
-        if ambush: tags.append(f"潜伏信号({'+'.join(ambush_details)})")
+        ambush, _ambush_details = detect_ambush_setup(sym, all_sym, code, "D")
+        if ambush: tags.append("潜伏信号")
 
         if not tags: continue
         bar = sym["D"]["data"][-1]
