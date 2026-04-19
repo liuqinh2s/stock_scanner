@@ -6,6 +6,7 @@ A股股票扫描器 — 扫描脚本
 周期: 15m, 60m, 日线(D), 周线(W)
 标签: 趋势共振 · 成交量异动 · 大盘方向 · 防追高
       · 龙头股 · 仙人指路 · 波动充足 · 小量大涨 · 盘整突破
+      · 潜伏信号 (盘整蓄势 + 底部支撑)
 """
 from __future__ import annotations
 
@@ -118,21 +119,28 @@ def save_cache(all_sym: dict):
     # 按交易所前缀拆分写入 (code 为纯数字, 6/9 开头归 sh, 其余归 sz)
     def _prefix(code: str) -> str:
         return "sh" if code.startswith(("6", "9")) else "sz"
-    total_mb = 0.0
-    for prefix in CACHE_PREFIXES:
-        shard = {k: v for k, v in slim.items() if _prefix(k) == prefix}
-        if not shard:
-            continue
+
+    def _compress_shard(prefix: str, shard: dict) -> tuple[str, int, float]:
         gz_file = CACHE_DIR / f"klines_{prefix}.json.gz"
         raw = json.dumps(shard, ensure_ascii=False).encode()
         gz_file.write_bytes(gzip.compress(raw))
         size_mb = gz_file.stat().st_size / 1024 / 1024
-        total_mb += size_mb
-        log.info("缓存分片 %s: %d 只股票, %.1f MB (gz)", prefix, len(shard), size_mb)
         # 删除旧的未压缩 JSON
         json_file = CACHE_DIR / f"klines_{prefix}.json"
         if json_file.exists():
             json_file.unlink()
+        return prefix, len(shard), size_mb
+
+    shards = {prefix: {k: v for k, v in slim.items() if _prefix(k) == prefix}
+              for prefix in CACHE_PREFIXES}
+    total_mb = 0.0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CACHE_PREFIXES)) as pool:
+        futures = {pool.submit(_compress_shard, p, s): p
+                   for p, s in shards.items() if s}
+        for f in concurrent.futures.as_completed(futures):
+            prefix, count, size_mb = f.result()
+            total_mb += size_mb
+            log.info("缓存分片 %s: %d 只股票, %.1f MB (gz)", prefix, count, size_mb)
     # 删除旧的单文件
     if CACHE_FILE.exists():
         CACHE_FILE.unlink()
@@ -347,10 +355,18 @@ TDX_SERVERS = [
     ("60.191.117.167", 7709),
     ("115.238.56.198", 7709),
     ("218.75.126.9", 7709),
+    ("106.120.74.166", 7709),
+    ("112.95.140.74", 7709),
+    ("113.105.142.136", 7709),
+    ("119.147.212.81", 7709),
+    ("221.231.141.60", 7709),
+    ("101.227.73.20", 7709),
+    ("101.227.77.254", 7709),
+    ("114.80.63.12", 7709),
 ]
 
 # 每个通达信服务器开几个并行连接 (连接数 × 服务器数 = 总并发)
-TDX_CONNS_PER_SERVER = 2
+TDX_CONNS_PER_SERVER = 3
 
 # pytdx category 映射: 0=5m, 1=15m, 2=30m, 3=60m, 4=日线, 11=周线
 _TDX_CATEGORY = {"15": 1, "60": 3, "D": 4, "W": 11}
@@ -456,10 +472,11 @@ def _probe_tdx_server(server: tuple) -> bool:
 
 async def fetch_klines_tdx(stocks: list[dict], cycle: str,
                            limit: int = 160,
-                           timeout: int = 180) -> dict[str, list[list]]:
+                           timeout: int = 0) -> dict[str, list[list]]:
     """用通达信多服务器并行拉取 K 线 (线程池).
     每个服务器开 TDX_CONNS_PER_SERVER 个连接并行拉取.
-    先探测存活服务器, 只分配任务给可用的; 超时后放弃未完成的 worker."""
+    先探测存活服务器, 只分配任务给可用的; 超时后放弃未完成的 worker.
+    timeout=0 表示自动根据任务量计算超时."""
     conns = TDX_CONNS_PER_SERVER
 
     # ── 第一步: 并行探测服务器存活性 ──
@@ -502,6 +519,11 @@ async def fetch_klines_tdx(stocks: list[dict], cycle: str,
     all_tasks = [(s["code"], _tdx_market(s["code"])) for s in stocks]
     chunks = [all_tasks[i::n_workers] for i in range(n_workers)]
     worker_servers = [servers[i // conns] for i in range(n_workers)]
+
+    # 动态超时: 根据最大分片大小, 每只股票约 0.5s, 给 2 倍余量, 最低 120s
+    max_chunk = max(len(c) for c in chunks) if chunks else 0
+    if timeout <= 0:
+        timeout = max(120, max_chunk * 1 + 30)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
     try:
@@ -557,7 +579,7 @@ async def _fetch_klines_sina(session: aiohttp.ClientSession, code: str,
            f"?symbol={sina_code}&scale={scale}&datalen={limit}&ma=")
     for attempt in range(3):
         try:
-            await asyncio.sleep(random.uniform(0.05, 0.3))
+            await asyncio.sleep(random.uniform(0.01, 0.1))
             async with session.get(url, proxy=proxy_url,
                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
@@ -583,7 +605,7 @@ async def _fetch_klines_sina(session: aiohttp.ClientSession, code: str,
         except Exception as e:
             if attempt == 2:
                 log.warning("新浪请求失败 (%d/3) %s: %s", attempt + 1, sina_code, str(e)[:60])
-        await asyncio.sleep(1.5 * (attempt + 1))
+        await asyncio.sleep(0.5 * (attempt + 1))
     return []
 
 
@@ -1235,6 +1257,215 @@ def detect_consolidation_breakout(sym, cycle="60"):
 
 
 # ══════════════════════════════════════════════════════════════
+#  潜伏信号 — 盘整蓄势 + 底部支撑 (突破前夜)
+# ══════════════════════════════════════════════════════════════
+
+def _boll_width_percentile(bolling, lookback=120):
+    """当前布林带宽度在近 lookback 根K线中的分位数 (0~100).
+    宽度 = (upper - lower) / mid. 分位数越低说明波动越收敛."""
+    upper, lower, mid = bolling["upper"], bolling["lower"], bolling["mid"]
+    n = len(mid)
+    if n < lookback or n < 2:
+        return 50
+    widths = []
+    for i in range(max(0, n - lookback), n):
+        if math.isnan(mid[i]) or mid[i] <= 0:
+            continue
+        widths.append((upper[i] - lower[i]) / mid[i])
+    if len(widths) < 20:
+        return 50
+    cur = widths[-1]
+    rank = sum(1 for w in widths if w <= cur)
+    return round(rank / len(widths) * 100)
+
+
+def _boll_width_narrowing(bolling, window=10):
+    """布林带宽度是否在持续收窄 (近 window 根的宽度斜率为负).
+    返回 True 表示波动正在进一步压缩."""
+    upper, lower, mid = bolling["upper"], bolling["lower"], bolling["mid"]
+    n = len(mid)
+    if n < window + 1:
+        return False
+    widths = []
+    for i in range(n - window, n):
+        if math.isnan(mid[i]) or mid[i] <= 0:
+            return False
+        widths.append((upper[i] - lower[i]) / mid[i])
+    # 简单线性回归斜率
+    x_mean = (window - 1) / 2
+    y_mean = sum(widths) / len(widths)
+    num = sum((i - x_mean) * (w - y_mean) for i, w in enumerate(widths))
+    den = sum((i - x_mean) ** 2 for i in range(len(widths)))
+    if den == 0:
+        return False
+    slope = num / den
+    return slope < 0
+
+
+def _intermittent_accumulation(data, lookback=20):
+    """间歇性放量不跌: 近 lookback 根K线中, 是否出现过放量但不跌的K线.
+    条件: 成交量 > 近期均量 2 倍, 但跌幅 < 1%.
+    返回符合条件的K线数量."""
+    n = len(data)
+    if n < lookback + 20:
+        return 0
+    # 近 60 根的平均成交量作为基准
+    base_start = max(0, n - 60)
+    base_vols = [float(data[i][6]) for i in range(base_start, n - 1)]
+    if not base_vols:
+        return 0
+    avg_vol = sum(base_vols) / len(base_vols)
+    if avg_vol <= 0:
+        return 0
+    count = 0
+    for i in range(n - lookback, n):
+        vol = float(data[i][6])
+        open_p = float(data[i][1])
+        close = float(data[i][4])
+        if open_p <= 0:
+            continue
+        drop = (open_p - close) / open_p
+        if vol > avg_vol * 2 and drop < 0.01:
+            count += 1
+    return count
+
+
+def _lower_shadow_density(data, lookback=20):
+    """下影线密度: 近 lookback 根K线中, 下影线 > 实体的K线占比.
+    下影线 = min(open, close) - low, 实体 = abs(close - open).
+    占比高说明下方支撑强."""
+    n = len(data)
+    if n < lookback:
+        return 0.0
+    count = 0
+    for i in range(n - lookback, n):
+        open_p, high, low, close = (float(data[i][1]), float(data[i][2]),
+                                     float(data[i][3]), float(data[i][4]))
+        body = abs(close - open_p)
+        lower_shadow = min(open_p, close) - low
+        if lower_shadow > body and lower_shadow > 0:
+            count += 1
+    return count / lookback
+
+
+def _relative_strength(sym, all_sym, lookback=20):
+    """个股相对大盘的强度: 个股近 lookback 日涨幅 - 大盘近 lookback 日涨幅.
+    正值说明比大盘强. 大盘用 000001 (上证指数) 近似."""
+    try:
+        d_data = sym["D"]["data"]
+        if len(d_data) < lookback + 1:
+            return 0.0
+        stock_ret = (float(d_data[-1][4]) - float(d_data[-lookback - 1][4])) / float(d_data[-lookback - 1][4])
+        # 尝试从 all_sym 中找上证指数
+        idx = all_sym.get("000001")
+        if not idx or "D" not in idx or len(idx["D"].get("data", [])) < lookback + 1:
+            return stock_ret  # 没有大盘数据, 返回绝对涨幅
+        idx_data = idx["D"]["data"]
+        idx_ret = (float(idx_data[-1][4]) - float(idx_data[-lookback - 1][4])) / float(idx_data[-lookback - 1][4])
+        return stock_ret - idx_ret
+    except (IndexError, KeyError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def detect_ambush_setup(sym, all_sym, code, cycle="D"):
+    """潜伏信号检测: 盘整蓄势 + 底部支撑 (突破前夜).
+
+    综合评分, 满足 4 项及以上视为潜伏信号:
+    1. 布林带宽度处于近120根K线最低25%分位
+    2. 布林带宽度持续收窄 (斜率为负)
+    3. 均线粘合 (MA散度 < 3%, 需要60m有MA数据)
+    4. 成交量萎缩 (近10根均量 < 近60根均量的65%)
+    5. RSI在中性区 (38~62, 不过热也不过冷)
+    6. 间歇性放量不跌 (有主力吸筹迹象)
+    7. 下影线密度高 (下方支撑强)
+    8. 相对大盘强势 (盘整期间跌得比大盘少)
+
+    返回: (bool, list[str]) — 是否触发, 满足的子条件列表
+    """
+    try:
+        c = sym.get(cycle)
+        if not c or "bolling" not in c:
+            return False, []
+        data = c.get("data", [])
+        bolling = c["bolling"]
+        if len(data) < 60:
+            return False, []
+
+        score = 0
+        details = []
+
+        # 1. 布林带宽度低分位
+        pct = _boll_width_percentile(bolling, 120)
+        if pct <= 25:
+            score += 1
+            details.append("带宽收敛")
+
+        # 2. 布林带持续收窄
+        if _boll_width_narrowing(bolling, 10):
+            score += 1
+            details.append("持续收窄")
+
+        # 3. 均线粘合 (用60m的MA数据, 如果有的话)
+        c60 = sym.get("60", {})
+        ma_keys = ["ma30", "ma60", "ma120"]
+        if all(k in c60 and len(c60[k]) >= 1 for k in ma_keys):
+            vals = [c60[k][-1] for k in ma_keys]
+            valid = [v for v in vals if v is not None and v == v and v > 0]
+            if len(valid) >= 3:
+                mx, mn = max(valid), min(valid)
+                if mn > 0 and (mx - mn) / mn < 0.03:
+                    score += 1
+                    details.append("均线粘合")
+
+        # 4. 成交量萎缩
+        n = len(data)
+        if n >= 60:
+            recent_vol = sum(float(data[i][6]) for i in range(n - 10, n)) / 10
+            base_vol = sum(float(data[i][6]) for i in range(n - 60, n - 10)) / 50
+            if base_vol > 0 and recent_vol < base_vol * 0.65:
+                score += 1
+                details.append("缩量蓄势")
+
+        # 5. RSI中性区
+        if "rsi" in c60 and len(c60.get("rsi", [])) >= 1:
+            rsi_val = c60["rsi"][-1]
+            if not math.isnan(rsi_val) and 38 <= rsi_val <= 62:
+                score += 1
+                details.append("RSI中性")
+        elif "macd" in c:
+            # 没有RSI时, 用MACD柱状图接近零轴作为替代
+            macd = c["macd"]
+            hist = macd["macdLine"][-1] - macd["signalLine"][-1]
+            if abs(hist) < abs(macd["macdLine"][-1]) * 0.3:
+                score += 1
+                details.append("MACD收敛")
+
+        # 6. 间歇性放量不跌
+        accum = _intermittent_accumulation(data, 20)
+        if accum >= 2:
+            score += 1
+            details.append(f"吸筹{accum}次")
+
+        # 7. 下影线密度
+        shadow = _lower_shadow_density(data, 20)
+        if shadow >= 0.25:
+            score += 1
+            details.append("下方支撑")
+
+        # 8. 相对强度
+        rs = _relative_strength(sym, all_sym, 20)
+        if rs > 0.01:
+            score += 1
+            details.append("强于大盘")
+
+        # 需要至少 4 项满足
+        return score >= 4, details
+
+    except (KeyError, IndexError, ValueError, TypeError):
+        return False, []
+
+
+# ══════════════════════════════════════════════════════════════
 #  数据校验 + 主流程
 # ══════════════════════════════════════════════════════════════
 
@@ -1305,7 +1536,7 @@ async def main():
             sys.exit(1)
 
         # 2. K线 (带缓存, 异步并发)
-        all_sym = await fetch_all_data(session, stocks, cache, max_concurrent=15)
+        all_sym = await fetch_all_data(session, stocks, cache, max_concurrent=40)
 
         # 3. 大盘方向 (上证指数, 辅助参考)
         index_direction = await get_index_direction(session)
@@ -1352,6 +1583,8 @@ async def main():
         if code in leading: tags.append("龙头股")
         if is_low_vol_good_move(sym): tags.append("小量大涨")
         if detect_consolidation_breakout(sym, "60"): tags.append("盘整突破")
+        ambush, ambush_details = detect_ambush_setup(sym, all_sym, code, "D")
+        if ambush: tags.append(f"潜伏信号({'+'.join(ambush_details)})")
 
         if not tags: continue
         bar = sym["D"]["data"][-1]
