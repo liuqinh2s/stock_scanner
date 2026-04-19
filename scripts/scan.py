@@ -377,7 +377,11 @@ def _fetch_klines_tdx_batch(server: tuple, tasks: list[tuple],
     host, port = server
     total = len(tasks)
     try:
-        with api.connect(host, port, time_out=10):
+        conn = api.connect(host, port, time_out=10)
+        if not conn:
+            log.warning("通达信 %s:%d 连接返回 False, 跳过", host, port)
+            return result
+        with conn:
             for i, (code, market) in enumerate(tasks):
                 try:
                     data = api.get_security_bars(category, market, code, 0, limit)
@@ -421,24 +425,84 @@ def _fetch_klines_tdx_batch(server: tuple, tasks: list[tuple],
     return result
 
 
+def _probe_tdx_server(server: tuple) -> bool:
+    """快速探测通达信服务器是否可连接."""
+    from pytdx.hq import TdxHq_API
+    import socket as _socket
+    api = TdxHq_API(auto_retry=False)
+    host, port = server
+    try:
+        conn = api.connect(host, port, time_out=5)
+        if not conn:
+            return False
+        # 连接成功, 立即断开
+        try:
+            if hasattr(api, 'client') and api.client:
+                sock = getattr(api.client, 'client', None)
+                if sock and isinstance(sock, _socket.socket):
+                    sock.settimeout(0)
+                    try:
+                        sock.shutdown(_socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sock.close()
+            api.disconnect()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def fetch_klines_tdx(stocks: list[dict], cycle: str,
                            limit: int = 160,
                            timeout: int = 180) -> dict[str, list[list]]:
     """用通达信多服务器并行拉取 K 线 (线程池).
     每个服务器开 TDX_CONNS_PER_SERVER 个连接并行拉取.
-    timeout: 最大等待秒数, 超时后放弃未完成的 worker."""
-    servers = TDX_SERVERS
+    先探测存活服务器, 只分配任务给可用的; 超时后放弃未完成的 worker."""
     conns = TDX_CONNS_PER_SERVER
+
+    # ── 第一步: 并行探测服务器存活性 ──
+    loop = asyncio.get_event_loop()
+    probe_pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(TDX_SERVERS))
+    try:
+        probe_futures = {
+            loop.run_in_executor(probe_pool, _probe_tdx_server, s): s
+            for s in TDX_SERVERS
+        }
+        probe_done, _ = await asyncio.wait(probe_futures.keys(), timeout=15)
+        servers = []
+        for f in probe_done:
+            s = probe_futures[f]
+            try:
+                if f.result():
+                    servers.append(s)
+                else:
+                    log.warning("通达信 %s:%d 探测失败, 跳过", s[0], s[1])
+            except Exception:
+                log.warning("通达信 %s:%d 探测异常, 跳过", s[0], s[1])
+        # 探测超时的也跳过
+        for f in probe_futures:
+            if f not in probe_done:
+                s = probe_futures[f]
+                log.warning("通达信 %s:%d 探测超时, 跳过", s[0], s[1])
+    finally:
+        probe_pool.shutdown(wait=False)
+
+    if not servers:
+        log.warning("所有通达信服务器不可用")
+        return {}
+
+    log.info("通达信存活服务器: %d/%d — %s",
+             len(servers), len(TDX_SERVERS),
+             ", ".join(s[0] for s in servers))
+
+    # ── 第二步: 只分配任务给存活服务器 ──
     n_workers = len(servers) * conns
-    # 构建任务列表
     all_tasks = [(s["code"], _tdx_market(s["code"])) for s in stocks]
-    # 均分到各 worker (同一服务器的多个连接分到不同 chunk)
     chunks = [all_tasks[i::n_workers] for i in range(n_workers)]
-    # worker -> server 映射: worker 0,1 -> server 0, worker 2,3 -> server 1, ...
     worker_servers = [servers[i // conns] for i in range(n_workers)]
 
-    loop = asyncio.get_event_loop()
-    # daemon 线程池: 主进程退出时不会被卡住的线程阻塞
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
     try:
         futures = [
@@ -446,7 +510,6 @@ async def fetch_klines_tdx(stocks: list[dict], cycle: str,
                                  worker_servers[i], chunks[i], cycle, limit)
             for i in range(n_workers)
         ]
-        # 带超时等待: 到时间后收集已完成的结果, 不再等卡住的服务器
         done, pending = await asyncio.wait(futures, timeout=timeout)
         if pending:
             for i, f in enumerate(futures):
@@ -701,7 +764,7 @@ async def fetch_all_data(session: aiohttp.ClientSession, stocks: list[dict],
     if incremental:
         # ── 第一阶段: 通达信批量拉 15m (主源, 多服务器并行) ──
         cached_stocks = [s for s in stocks if s["code"] in cached_codes_set]
-        log.info("通达信拉取 15m K线: %d 只股票, %d 个服务器 × %d 连接并行",
+        log.info("通达信拉取 15m K线: %d 只股票 (配置 %d 服务器 × %d 连接)",
                  len(cached_stocks), len(TDX_SERVERS), TDX_CONNS_PER_SERVER)
         tdx_result = await fetch_klines_tdx(cached_stocks, "15",
                                             limit=CYCLE_MAX_BARS.get("15", 160))
